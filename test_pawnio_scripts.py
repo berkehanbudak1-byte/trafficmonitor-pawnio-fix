@@ -47,6 +47,14 @@ class TestPawnIOScripts(unittest.TestCase):
             cleaned = re.sub(r"@'.*?'@", "", cleaned, flags=re.S)
             self.assertEqual(cleaned.count("{"), cleaned.count("}"), f"Unbalanced braces in {name}")
 
+    def test_verify_ps1_supports_selftest_mode(self):
+        verify_src = (ROOT / "verify.ps1").read_text(encoding="utf-8")
+        self.assertIn("[switch]$SelfTest", verify_src)
+        self.assertIn("if ($SelfTest)", verify_src)
+        self.assertIn("self_test = $true", verify_src)
+        self.assertIn("clean_dll_passes", verify_src)
+        self.assertIn("winring0_dll_detected", verify_src)
+
 
 if __name__ == "__main__":
     unittest.main()

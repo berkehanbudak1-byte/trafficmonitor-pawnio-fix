@@ -7,7 +7,8 @@
 [CmdletBinding()]
 param(
     [string]$TrafficMonitorPath,
-    [switch]$Json
+    [switch]$Json,
+    [switch]$SelfTest
 )
 
 function Ok($m)   { if (-not $Json) { Write-Host "[OK] $m" -ForegroundColor Green } }
@@ -15,6 +16,31 @@ function Bad($m)  { if (-not $Json) { Write-Host "[X]  $m" -ForegroundColor Red 
 function Info($m) { if (-not $Json) { Write-Host "[*]  $m" } }
 $failed = $false
 $errors = @()
+
+if ($SelfTest) {
+    $cleanBytes = [Text.Encoding]::ASCII.GetBytes('LibreHardwareMonitor.PawnIO.Driver')
+    $dirtyBytes = [Text.Encoding]::ASCII.GetBytes('LibreHardwareMonitor.WinRing0.Driver')
+    $cleanTxt = [Text.Encoding]::ASCII.GetString($cleanBytes) + [Text.Encoding]::Unicode.GetString($cleanBytes)
+    $dirtyTxt = [Text.Encoding]::ASCII.GetString($dirtyBytes) + [Text.Encoding]::Unicode.GetString($dirtyBytes)
+    $cleanPass = -not [bool]($cleanTxt -match 'WinRing0')
+    $dirtyPass = [bool]($dirtyTxt -match 'WinRing0')
+    $selfTestOk = [bool]($cleanPass -and $dirtyPass)
+    if (-not $selfTestOk) { Bad 'SelfTest WinRing0 signature detection failed' }
+    else { Ok 'SelfTest WinRing0 signature detection passed' }
+    if ($Json) {
+        [ordered]@{
+            ok = $selfTestOk
+            self_test = $true
+            checks = [ordered]@{
+                clean_dll_passes = $cleanPass
+                winring0_dll_detected = $dirtyPass
+            }
+            errors = $errors
+        } | ConvertTo-Json -Depth 4
+    }
+    if ($selfTestOk) { exit 0 } else { exit 1 }
+}
+
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 $proc = Get-Process TrafficMonitor -ErrorAction SilentlyContinue | Select-Object -First 1
