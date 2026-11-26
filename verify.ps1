@@ -4,13 +4,20 @@
     Run from an elevated PowerShell for the full check (sensor reading needs admin rights).
 #>
 [CmdletBinding()]
-param([string]$TrafficMonitorPath = 'C:\Program Files\TrafficMonitor')
+param([string]$TrafficMonitorPath)
 
 function Ok($m)   { Write-Host "[OK] $m" -ForegroundColor Green }
 function Bad($m)  { Write-Host "[X]  $m" -ForegroundColor Red; $script:failed = $true }
 function Info($m) { Write-Host "[*]  $m" }
 $failed = $false
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $TrafficMonitorPath) {
+    $proc = Get-Process TrafficMonitor -ErrorAction SilentlyContinue | Select-Object -First 1
+    $exePath = $null
+    if ($proc) { try { $exePath = $proc.Path } catch {} }
+    $TrafficMonitorPath = if ($exePath) { Split-Path $exePath } else { 'C:\Program Files\TrafficMonitor' }
+}
 
 $lhm = Join-Path $TrafficMonitorPath 'LibreHardwareMonitorLib.dll'
 if (-not (Test-Path $lhm)) { Bad "LibreHardwareMonitorLib.dll not found in $TrafficMonitorPath"; exit 1 }

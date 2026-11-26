@@ -6,13 +6,20 @@
     Note: the original library will reinstall the vulnerable WinRing0 driver on next start.
 #>
 [CmdletBinding()]
-param([string]$TrafficMonitorPath = 'C:\Program Files\TrafficMonitor')
+param([string]$TrafficMonitorPath)
 $ErrorActionPreference = 'Stop'
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Host '[X] Run from an elevated PowerShell.' -ForegroundColor Red; exit 1 }
 
-$backup = Get-ChildItem $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' | Sort-Object Name -Descending | Select-Object -First 1
+if (-not $TrafficMonitorPath) {
+    $proc = Get-Process TrafficMonitor -ErrorAction SilentlyContinue | Select-Object -First 1
+    $exePath = $null
+    if ($proc) { try { $exePath = $proc.Path } catch {} }
+    $TrafficMonitorPath = if ($exePath) { Split-Path $exePath } else { 'C:\Program Files\TrafficMonitor' }
+}
+
+$backup = Get-ChildItem $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
 if (-not $backup) { Write-Host "[X] No _backup_lhm_* folder in $TrafficMonitorPath" -ForegroundColor Red; exit 1 }
 Write-Host "[*] Restoring from $($backup.FullName)"
 

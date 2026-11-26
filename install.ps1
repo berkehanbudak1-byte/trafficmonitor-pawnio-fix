@@ -104,7 +104,8 @@ while ($queue.Count) {
     $nupkg = Join-Path $pkgDir "$lid.$lver.nupkg"
     Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$lid/$lver/$lid.$lver.nupkg" -OutFile $nupkg -UseBasicParsing
 
-    $local = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($nupkg)))
+    $sha = [Security.Cryptography.SHA512]::Create()
+    try { $local = [Convert]::ToBase64String($sha.ComputeHash([IO.File]::ReadAllBytes($nupkg))) } finally { $sha.Dispose() }
     if ($local -ne (Get-CatalogHash $id $ver)) { Fail "Hash mismatch for $id $ver - aborting." }
 
     $zip = [IO.Compression.ZipFile]::OpenRead($nupkg)
