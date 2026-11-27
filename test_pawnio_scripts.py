@@ -122,6 +122,72 @@ class TestPawnIOScripts(unittest.TestCase):
             src = (ROOT / name).read_text(encoding="utf-8")
             self.assertNotRegex(src, r"(?i)\b(Invoke-Expression|iex)\b", name)
 
+    def test_turkish_locale_safety_invariant_casing_and_culture(self):
+        for name in ("install.ps1", "verify.ps1", "rollback.ps1"):
+            src = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("InvariantCulture", src, f"{name} must force InvariantCulture")
+            self.assertNotRegex(src, r"\.To(Lower|Upper)\(", f"{name} must not use locale-sensitive ToLower/ToUpper")
+
+        install_src = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        self.assertIn("$id.ToLowerInvariant()", install_src)
+        self.assertIn("$ver.ToLowerInvariant()", install_src)
+
+    def test_verify_ps1_queries_drivers_even_when_dll_missing(self):
+        verify_src = (ROOT / "verify.ps1").read_text(encoding="utf-8")
+        self.assertIn("function Get-DriverStatus(", verify_src)
+        self.assertIn("Win32_SystemDriver", verify_src)
+        self.assertIn("Get-Service", verify_src)
+        self.assertIn("'WinRing0_1_2_0'", verify_src)
+        self.assertIn("'R0TrafficMonitor'", verify_src)
+        self.assertIn("'PawnIO'", verify_src)
+
+        # Driver queries must happen before the missing-DLL early-return block
+        driver_query_pos = verify_src.find("$r0Driver = Get-DriverStatus")
+        missing_dll_pos = verify_src.find("if (-not (Test-Path -LiteralPath $lhm))")
+        self.assertGreater(driver_query_pos, 0)
+        self.assertGreater(missing_dll_pos, driver_query_pos)
+
+        # $missingReport must use real queried driver status, never hardcoded $false
+        m = re.search(r"\$missingReport\s*=\s*\[ordered\]@\{.*?\n    \}", verify_src, flags=re.S)
+        self.assertIsNotNone(m)
+        missing_block = m.group(0)
+        self.assertIn("service_present = $r0ServicePresent", missing_block)
+        self.assertIn("installed = [bool]$pawn", missing_block)
+        self.assertNotIn("service_present = $false", missing_block)
+        self.assertNotIn("installed = $false", missing_block)
+
+    def test_try_finally_temp_script_and_dir_cleanup(self):
+        install_src = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        verify_src = (ROOT / "verify.ps1").read_text(encoding="utf-8")
+
+        # install.ps1 must clean up both probe.ps1 and $work inside finally blocks
+        self.assertRegex(
+            install_src,
+            r"finally\s*\{[^}]*Remove-Item\s+-LiteralPath\s+\$probeFile",
+        )
+        self.assertRegex(
+            install_src,
+            r"finally\s*\{[^}]*Remove-Item\s+-LiteralPath\s+\$work\s+-Recurse\s+-Force",
+        )
+        # verify.ps1 must clean up elevated $tmp inside a finally block
+        self.assertRegex(
+            verify_src,
+            r"finally\s*\{[^}]*Remove-Item\s+-LiteralPath\s+\$tmp\s+-Recurse\s+-Force",
+        )
+        # PowerShell here-string terminators '@ must be at column 0
+        for name, src in (("install.ps1", install_src), ("verify.ps1", verify_src)):
+            self.assertNotRegex(src, r"(?m)^[ \t]+'@$", f"Indented here-string terminator in {name}")
+
+    def test_readme_documents_verify_flags(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for flag in ("-Json", "-SelfTest", "-ExportReport"):
+            self.assertIn(flag, readme, f"README.md must document {flag}")
+
+    def test_ci_workflow_runs_unittest_discover(self):
+        ci = ROOT / ".github" / "workflows" / "ci.yml"
+        self.assertTrue(ci.exists(), ".github/workflows/ci.yml missing")
+        self.assertIn("unittest discover", ci.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

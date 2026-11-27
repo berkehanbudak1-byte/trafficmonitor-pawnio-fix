@@ -128,6 +128,17 @@ Exemple de résultat :
        GpuNvidia | NVIDIA GeForce RTX 3080 Ti Laptop GPU | GPU Core = 58.0 C
 ```
 
+Options supplémentaires de `verify.ps1` :
+- `-Json` : émet un rapport structuré JSON (pour le monitoring automatisé).
+- `-SelfTest` : teste la détection WinRing0 hors ligne (sans droits administrateur).
+- `-ExportReport <chemin>` : exporte une fiche de santé diagnostique en HTML (`.html`) ou Markdown (`.md`).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\verify.ps1 -Json
+powershell -ExecutionPolicy Bypass -File .\verify.ps1 -SelfTest
+powershell -ExecutionPolicy Bypass -File .\verify.ps1 -ExportReport .\health-card.html
+```
+
 ### Retour arrière
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rollback.ps1
@@ -180,6 +191,9 @@ swapped in place.
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -DryRun   # download + verify only
 powershell -ExecutionPolicy Bypass -File .\install.ps1           # elevated: backup, remove WinRing0, install
 powershell -ExecutionPolicy Bypass -File .\verify.ps1            # elevated: full check incl. sensor read
+powershell -ExecutionPolicy Bypass -File .\verify.ps1 -Json      # structured JSON diagnostics
+powershell -ExecutionPolicy Bypass -File .\verify.ps1 -SelfTest  # offline WinRing0 detection self-test
+powershell -ExecutionPolicy Bypass -File .\verify.ps1 -ExportReport .\health-card.html  # HTML (.html) or Markdown (.md) health card
 powershell -ExecutionPolicy Bypass -File .\rollback.ps1          # elevated: restore original (re-enables WinRing0)
 ```
 
