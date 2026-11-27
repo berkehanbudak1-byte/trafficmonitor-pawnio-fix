@@ -13,6 +13,9 @@ param(
     [string]$ExportReport
 )
 
+[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture
+[Threading.Thread]::CurrentThread.CurrentUICulture = [Globalization.CultureInfo]::InvariantCulture
+
 function Ok($m)   { if (-not $Json) { Write-Host "[OK] $m" -ForegroundColor Green } }
 function Bad($m)  { if (-not $Json) { Write-Host "[X]  $m" -ForegroundColor Red }; $script:failed = $true; $script:errors += $m }
 function Info($m) { if (-not $Json) { Write-Host "[*]  $m" } }
@@ -35,6 +38,17 @@ function ConvertTo-SafeMarkdown([object]$Value) {
     $s = $s -replace '\\', '\\'
     $s = $s -replace '([`*_[\]<>|])', '\$1'
     return $s
+}
+
+function Get-DriverStatus([string[]]$Names) {
+    foreach ($name in $Names) {
+        if ($name -notmatch '^[A-Za-z0-9._-]+$') { continue }
+        $drv = Get-CimInstance Win32_SystemDriver -Filter "Name='$name'" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($drv) { return $drv }
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($svc) { return [pscustomobject]@{ Name = $svc.Name; State = "$($svc.Status)" } }
+    }
+    return $null
 }
 
 if ($ExportReport) {
@@ -157,9 +171,20 @@ $tmExeVersion = if ($tmExePresent) { (Get-Item -LiteralPath $tmExe).VersionInfo.
 $backups = @(Get-ChildItem -LiteralPath $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
 $latestBackup = if ($backups.Count -gt 0) { $backups[0].FullName } else { $null }
 
+$r0Driver = Get-DriverStatus @('R0TrafficMonitor', 'WinRing0_1_2_0')
+$r0ServicePresent = [bool]$r0Driver
+$sysFilePresent = Test-Path -LiteralPath (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys')
+$pawn = Get-DriverStatus @('PawnIO')
+
 $lhm = Join-Path $TrafficMonitorPath 'LibreHardwareMonitorLib.dll'
 if (-not (Test-Path -LiteralPath $lhm)) {
     Bad "LibreHardwareMonitorLib.dll not found in $TrafficMonitorPath"
+    if ($r0ServicePresent) { Bad "WinRing0 service ($($r0Driver.Name)) exists" }
+    else { Ok 'No WinRing0 service (R0TrafficMonitor / WinRing0_1_2_0)' }
+    if ($sysFilePresent) { Bad 'WinRing0 driver file TrafficMonitor.sys present' }
+    else { Ok 'No WinRing0 driver file (TrafficMonitor.sys)' }
+    if ($pawn) { Ok "PawnIO driver installed ($($pawn.State))" }
+    else { Bad 'PawnIO driver not installed' }
     $missingReport = [ordered]@{
         ok = $false
         is_admin = $isAdmin
@@ -173,12 +198,12 @@ if (-not (Test-Path -LiteralPath $lhm)) {
             embeds_winring0 = $null
         }
         winring0 = [ordered]@{
-            service_present = $false
-            driver_file_present = (Test-Path -LiteralPath (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys'))
+            service_present = $r0ServicePresent
+            driver_file_present = $sysFilePresent
         }
         pawnio = [ordered]@{
-            installed = $false
-            state = $null
+            installed = [bool]$pawn
+            state = if ($pawn) { "$($pawn.State)" } else { $null }
         }
         backup = [ordered]@{
             present = ($backups.Count -gt 0)
@@ -203,15 +228,12 @@ $embedsWinRing0 = [bool]($txt -match 'WinRing0')
 if ($embedsWinRing0) { Bad "LibreHardwareMonitorLib $ver still embeds WinRing0 (TrafficMonitor update reverted the fix?)" }
 else { Ok "LibreHardwareMonitorLib $ver does not embed WinRing0" }
 
-$r0ServicePresent = [bool](Get-CimInstance Win32_SystemDriver -Filter "Name='R0TrafficMonitor'" -ErrorAction SilentlyContinue)
-if ($r0ServicePresent) { Bad 'WinRing0 service R0TrafficMonitor exists' }
-else { Ok 'No WinRing0 service (R0TrafficMonitor)' }
+if ($r0ServicePresent) { Bad "WinRing0 service ($($r0Driver.Name)) exists" }
+else { Ok 'No WinRing0 service (R0TrafficMonitor / WinRing0_1_2_0)' }
 
-$sysFilePresent = Test-Path -LiteralPath (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys')
 if ($sysFilePresent) { Bad 'WinRing0 driver file TrafficMonitor.sys present' }
 else { Ok 'No WinRing0 driver file (TrafficMonitor.sys)' }
 
-$pawn = Get-CimInstance Win32_SystemDriver -Filter "Name='PawnIO'" -ErrorAction SilentlyContinue
 if ($pawn) { Ok "PawnIO driver installed ($($pawn.State))" } else { Bad 'PawnIO driver not installed' }
 
 $sensorReadings = @()
@@ -220,9 +242,10 @@ if (-not $isAdmin) {
 } else {
     # Read sensors with a copy of the installed library (does not lock TrafficMonitor's files)
     $tmp = Join-Path $env:TEMP ('tm-verify-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    Copy-Item -Path (Join-Path $TrafficMonitorPath '*.dll') -Destination $tmp -Force
-    $test = @'
+    try {
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        Copy-Item -Path (Join-Path $TrafficMonitorPath '*.dll') -Destination $tmp -Force
+        $test = @'
 param($dir)
 Add-Type -Path (Join-Path $dir 'LibreHardwareMonitorLib.dll')
 $c = New-Object LibreHardwareMonitor.Hardware.Computer
@@ -235,13 +258,17 @@ foreach ($h in $c.Hardware) {
 }
 $c.Close()
 '@
-    $tf = Join-Path $tmp 'test.ps1'; Set-Content -LiteralPath $tf -Value $test -Encoding UTF8
-    $res = & powershell -NoProfile -ExecutionPolicy Bypass -File "$tf" "$tmp" 2>&1
-    $sensorReadings = @($res | ForEach-Object { "$_" })
-    if ($res | Where-Object { $_ -match '^Cpu \|' }) { Ok 'CPU temperature read through PawnIO:'; if (-not $Json) { $res | ForEach-Object { Write-Host "       $_" } } }
-    else { Bad 'Could not read CPU temperature'; if (-not $Json) { $res | ForEach-Object { Write-Host "       $_" } } }
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    if (Get-CimInstance Win32_SystemDriver -Filter "Name='R0TrafficMonitor'" -ErrorAction SilentlyContinue) {
+        $tf = Join-Path $tmp 'test.ps1'; Set-Content -LiteralPath $tf -Value $test -Encoding UTF8
+        $res = & powershell -NoProfile -ExecutionPolicy Bypass -File "$tf" "$tmp" 2>&1
+        $sensorReadings = @($res | ForEach-Object { "$_" })
+        if ($res | Where-Object { $_ -match '^Cpu \|' }) { Ok 'CPU temperature read through PawnIO:'; if (-not $Json) { $res | ForEach-Object { Write-Host "       $_" } } }
+        else { Bad 'Could not read CPU temperature'; if (-not $Json) { $res | ForEach-Object { Write-Host "       $_" } } }
+    } finally {
+        if ($tmp -and (Test-Path -LiteralPath $tmp)) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Get-DriverStatus @('R0TrafficMonitor', 'WinRing0_1_2_0')) {
         $r0ServicePresent = $true
         Bad 'WinRing0 service was recreated during the test'
     }

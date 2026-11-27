@@ -8,6 +8,8 @@
 [CmdletBinding()]
 param([string]$TrafficMonitorPath)
 $ErrorActionPreference = 'Stop'
+[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture
+[Threading.Thread]::CurrentThread.CurrentUICulture = [Globalization.CultureInfo]::InvariantCulture
 
 function Test-SafePath([string]$PathValue, [string]$ParamName = 'Path') {
     if ([string]::IsNullOrWhiteSpace($PathValue)) { Write-Host "[X] Invalid ${ParamName}: path cannot be empty." -ForegroundColor Red; exit 1 }
