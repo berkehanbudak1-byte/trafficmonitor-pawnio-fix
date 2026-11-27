@@ -19,8 +19,31 @@ function Info($m) { if (-not $Json) { Write-Host "[*]  $m" } }
 $failed = $false
 $errors = @()
 
+function Test-SafePath([string]$PathValue, [string]$ParamName = 'Path') {
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { throw "Invalid ${ParamName}: path cannot be empty." }
+    if ($PathValue -match '[\x00-\x1f]') { throw "Invalid ${ParamName}: control characters are not allowed." }
+    if ($PathValue -match '(^|[\\/])\.\.([\\/]|$)') { throw "Invalid ${ParamName}: path traversal ('..') is not allowed." }
+    return $PathValue.Trim()
+}
+
+function ConvertTo-SafeHtml([object]$Value) {
+    return [System.Net.WebUtility]::HtmlEncode(([string]$Value -replace '[\x00-\x08\x0b\x0c\x0e-\x1f]', ''))
+}
+
+function ConvertTo-SafeMarkdown([object]$Value) {
+    $s = ([string]$Value -replace '[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]', ' ').Trim()
+    $s = $s -replace '\\', '\\'
+    $s = $s -replace '([`*_[\]<>|])', '\$1'
+    return $s
+}
+
+if ($ExportReport) {
+    $ExportReport = Test-SafePath $ExportReport 'ExportReport'
+}
+
 function Export-HealthReport($report, [string]$outPath) {
     if (-not $outPath) { return }
+    $outPath = Test-SafePath $outPath 'ExportReport'
     $parent = Split-Path -Path $outPath -Parent
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
@@ -31,31 +54,31 @@ function Export-HealthReport($report, [string]$outPath) {
         $lines = New-Object System.Collections.ArrayList
         [void]$lines.Add('# TrafficMonitor PawnIO Diagnostic Health Card')
         [void]$lines.Add('')
-        [void]$lines.Add("- **Status:** $statusLabel")
-        [void]$lines.Add("- **Generated:** $ts")
+        [void]$lines.Add("- **Status:** $(ConvertTo-SafeMarkdown $statusLabel)")
+        [void]$lines.Add("- **Generated:** $(ConvertTo-SafeMarkdown $ts)")
         if ($report.self_test) {
             [void]$lines.Add('- **Mode:** SelfTest')
-            [void]$lines.Add("- **Clean DLL Passes:** $($report.checks.clean_dll_passes)")
-            [void]$lines.Add("- **WinRing0 DLL Detected:** $($report.checks.winring0_dll_detected)")
+            [void]$lines.Add("- **Clean DLL Passes:** $([bool]$report.checks.clean_dll_passes)")
+            [void]$lines.Add("- **WinRing0 DLL Detected:** $([bool]$report.checks.winring0_dll_detected)")
         } else {
-            [void]$lines.Add("- **Admin Elevated:** $($report.is_admin)")
-            [void]$lines.Add("- **Install Path:** ``$($report.traffic_monitor.path)``")
-            [void]$lines.Add("- **LibreHardwareMonitorLib Version:** $($report.traffic_monitor.lhm_version)")
-            [void]$lines.Add("- **Embeds WinRing0:** $($report.traffic_monitor.embeds_winring0)")
-            [void]$lines.Add("- **R0TrafficMonitor Service:** $($report.winring0.service_present)")
-            [void]$lines.Add("- **TrafficMonitor.sys Present:** $($report.winring0.driver_file_present)")
-            [void]$lines.Add("- **PawnIO Installed:** $($report.pawnio.installed) ($($report.pawnio.state))")
-            [void]$lines.Add("- **Backup Count:** $($report.backup.count)")
+            [void]$lines.Add("- **Admin Elevated:** $([bool]$report.is_admin)")
+            [void]$lines.Add("- **Install Path:** ``$(ConvertTo-SafeMarkdown $report.traffic_monitor.path)``")
+            [void]$lines.Add("- **LibreHardwareMonitorLib Version:** $(ConvertTo-SafeMarkdown $report.traffic_monitor.lhm_version)")
+            [void]$lines.Add("- **Embeds WinRing0:** $(ConvertTo-SafeMarkdown $report.traffic_monitor.embeds_winring0)")
+            [void]$lines.Add("- **R0TrafficMonitor Service:** $([bool]$report.winring0.service_present)")
+            [void]$lines.Add("- **TrafficMonitor.sys Present:** $([bool]$report.winring0.driver_file_present)")
+            [void]$lines.Add("- **PawnIO Installed:** $([bool]$report.pawnio.installed) ($(ConvertTo-SafeMarkdown $report.pawnio.state))")
+            [void]$lines.Add("- **Backup Count:** $([int]$report.backup.count)")
         }
         if ($report.sensors -and $report.sensors.Count -gt 0) {
             [void]$lines.Add('')
             [void]$lines.Add('## Sensor Readings')
-            foreach ($s in $report.sensors) { [void]$lines.Add("- $s") }
+            foreach ($s in $report.sensors) { [void]$lines.Add("- $(ConvertTo-SafeMarkdown $s)") }
         }
         if ($report.errors -and $report.errors.Count -gt 0) {
             [void]$lines.Add('')
             [void]$lines.Add('## Errors')
-            foreach ($e in $report.errors) { [void]$lines.Add("- $e") }
+            foreach ($e in $report.errors) { [void]$lines.Add("- $(ConvertTo-SafeMarkdown $e)") }
         }
         ($lines -join "`n") | Out-File -LiteralPath $outPath -Encoding utf8
         return
@@ -64,27 +87,28 @@ function Export-HealthReport($report, [string]$outPath) {
     $rows = New-Object System.Collections.ArrayList
     if ($report.self_test) {
         [void]$rows.Add('<tr><td>Mode</td><td>SelfTest</td></tr>')
-        [void]$rows.Add("<tr><td>Clean DLL Passes</td><td>$($report.checks.clean_dll_passes)</td></tr>")
-        [void]$rows.Add("<tr><td>WinRing0 DLL Detected</td><td>$($report.checks.winring0_dll_detected)</td></tr>")
+        [void]$rows.Add("<tr><td>Clean DLL Passes</td><td>$(ConvertTo-SafeHtml $report.checks.clean_dll_passes)</td></tr>")
+        [void]$rows.Add("<tr><td>WinRing0 DLL Detected</td><td>$(ConvertTo-SafeHtml $report.checks.winring0_dll_detected)</td></tr>")
     } else {
-        [void]$rows.Add("<tr><td>Install Path</td><td>$([System.Net.WebUtility]::HtmlEncode([string]$report.traffic_monitor.path))</td></tr>")
-        [void]$rows.Add("<tr><td>LibreHardwareMonitorLib</td><td>$([System.Net.WebUtility]::HtmlEncode([string]$report.traffic_monitor.lhm_version))</td></tr>")
-        [void]$rows.Add("<tr><td>Embeds WinRing0</td><td>$($report.traffic_monitor.embeds_winring0)</td></tr>")
-        [void]$rows.Add("<tr><td>R0TrafficMonitor Service</td><td>$($report.winring0.service_present)</td></tr>")
-        [void]$rows.Add("<tr><td>TrafficMonitor.sys</td><td>$($report.winring0.driver_file_present)</td></tr>")
-        [void]$rows.Add("<tr><td>PawnIO Driver</td><td>$($report.pawnio.installed) ($([System.Net.WebUtility]::HtmlEncode([string]$report.pawnio.state)))</td></tr>")
-        [void]$rows.Add("<tr><td>Backups</td><td>$($report.backup.count)</td></tr>")
+        [void]$rows.Add("<tr><td>Install Path</td><td>$(ConvertTo-SafeHtml $report.traffic_monitor.path)</td></tr>")
+        [void]$rows.Add("<tr><td>LibreHardwareMonitorLib</td><td>$(ConvertTo-SafeHtml $report.traffic_monitor.lhm_version)</td></tr>")
+        [void]$rows.Add("<tr><td>Embeds WinRing0</td><td>$(ConvertTo-SafeHtml $report.traffic_monitor.embeds_winring0)</td></tr>")
+        [void]$rows.Add("<tr><td>R0TrafficMonitor Service</td><td>$(ConvertTo-SafeHtml $report.winring0.service_present)</td></tr>")
+        [void]$rows.Add("<tr><td>TrafficMonitor.sys</td><td>$(ConvertTo-SafeHtml $report.winring0.driver_file_present)</td></tr>")
+        [void]$rows.Add("<tr><td>PawnIO Driver</td><td>$(ConvertTo-SafeHtml $report.pawnio.installed) ($(ConvertTo-SafeHtml $report.pawnio.state))</td></tr>")
+        [void]$rows.Add("<tr><td>Backups</td><td>$(ConvertTo-SafeHtml $report.backup.count)</td></tr>")
     }
     if ($report.sensors -and $report.sensors.Count -gt 0) {
-        $sensorTxt = ($report.sensors | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) }) -join '<br>'
+        $sensorTxt = ($report.sensors | ForEach-Object { ConvertTo-SafeHtml $_ }) -join '<br>'
         [void]$rows.Add("<tr><td>Sensors</td><td>$sensorTxt</td></tr>")
     }
     if ($report.errors -and $report.errors.Count -gt 0) {
-        $errTxt = ($report.errors | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) }) -join '; '
+        $errTxt = ($report.errors | ForEach-Object { ConvertTo-SafeHtml $_ }) -join '; '
         [void]$rows.Add("<tr><td>Errors</td><td>$errTxt</td></tr>")
     }
     $rowHtml = $rows -join "`n"
-    $html = "<!doctype html><html><head><meta charset='utf-8'><title>TrafficMonitor PawnIO Health Card</title><style>body{font-family:sans-serif;margin:24px;background:#0f172a;color:#e2e8f0}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #334155;padding:8px;text-align:left;font-size:13px}th{background:#1e293b}.badge{display:inline-block;padding:6px 12px;border-radius:6px;background:$badgeBg;color:#fff;font-weight:bold}</style></head><body><h1>TrafficMonitor PawnIO Diagnostic Health Card</h1><div class='badge'>$statusLabel | $ts</div><table><thead><tr><th>Check</th><th>Result</th></tr></thead><tbody>$rowHtml</tbody></table></body></html>"
+    $safeBadge = "$(ConvertTo-SafeHtml $statusLabel) | $(ConvertTo-SafeHtml $ts)"
+    $html = "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=`"default-src 'none'; style-src 'unsafe-inline'`"><title>TrafficMonitor PawnIO Health Card</title><style>body{font-family:sans-serif;margin:24px;background:#0f172a;color:#e2e8f0}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border:1px solid #334155;padding:8px;text-align:left;font-size:13px}th{background:#1e293b}.badge{display:inline-block;padding:6px 12px;border-radius:6px;background:$badgeBg;color:#fff;font-weight:bold}</style></head><body><h1>TrafficMonitor PawnIO Diagnostic Health Card</h1><div class='badge'>$safeBadge</div><table><thead><tr><th>Check</th><th>Result</th></tr></thead><tbody>$rowHtml</tbody></table></body></html>"
     $html | Out-File -LiteralPath $outPath -Encoding utf8
 }
 
@@ -125,15 +149,16 @@ if (-not $TrafficMonitorPath) {
     if ($proc) { try { $exePath = $proc.Path } catch {} }
     $TrafficMonitorPath = if ($exePath) { Split-Path $exePath } else { 'C:\Program Files\TrafficMonitor' }
 }
+$TrafficMonitorPath = Test-SafePath $TrafficMonitorPath 'TrafficMonitorPath'
 
 $tmExe = Join-Path $TrafficMonitorPath 'TrafficMonitor.exe'
-$tmExePresent = Test-Path $tmExe
-$tmExeVersion = if ($tmExePresent) { (Get-Item $tmExe).VersionInfo.FileVersion } else { $null }
-$backups = @(Get-ChildItem $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+$tmExePresent = Test-Path -LiteralPath $tmExe
+$tmExeVersion = if ($tmExePresent) { (Get-Item -LiteralPath $tmExe).VersionInfo.FileVersion } else { $null }
+$backups = @(Get-ChildItem -LiteralPath $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
 $latestBackup = if ($backups.Count -gt 0) { $backups[0].FullName } else { $null }
 
 $lhm = Join-Path $TrafficMonitorPath 'LibreHardwareMonitorLib.dll'
-if (-not (Test-Path $lhm)) {
+if (-not (Test-Path -LiteralPath $lhm)) {
     Bad "LibreHardwareMonitorLib.dll not found in $TrafficMonitorPath"
     $missingReport = [ordered]@{
         ok = $false
@@ -149,7 +174,7 @@ if (-not (Test-Path $lhm)) {
         }
         winring0 = [ordered]@{
             service_present = $false
-            driver_file_present = (Test-Path (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys'))
+            driver_file_present = (Test-Path -LiteralPath (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys'))
         }
         pawnio = [ordered]@{
             installed = $false
@@ -171,7 +196,7 @@ if (-not (Test-Path $lhm)) {
     }
     exit 1
 }
-$ver = (Get-Item $lhm).VersionInfo.FileVersion
+$ver = (Get-Item -LiteralPath $lhm).VersionInfo.FileVersion
 $raw = [IO.File]::ReadAllBytes($lhm)
 $txt = [Text.Encoding]::ASCII.GetString($raw) + [Text.Encoding]::Unicode.GetString($raw)
 $embedsWinRing0 = [bool]($txt -match 'WinRing0')
@@ -182,7 +207,7 @@ $r0ServicePresent = [bool](Get-CimInstance Win32_SystemDriver -Filter "Name='R0T
 if ($r0ServicePresent) { Bad 'WinRing0 service R0TrafficMonitor exists' }
 else { Ok 'No WinRing0 service (R0TrafficMonitor)' }
 
-$sysFilePresent = Test-Path (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys')
+$sysFilePresent = Test-Path -LiteralPath (Join-Path $TrafficMonitorPath 'TrafficMonitor.sys')
 if ($sysFilePresent) { Bad 'WinRing0 driver file TrafficMonitor.sys present' }
 else { Ok 'No WinRing0 driver file (TrafficMonitor.sys)' }
 
@@ -195,8 +220,8 @@ if (-not $isAdmin) {
 } else {
     # Read sensors with a copy of the installed library (does not lock TrafficMonitor's files)
     $tmp = Join-Path $env:TEMP ('tm-verify-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    New-Item -ItemType Directory -Force $tmp | Out-Null
-    Copy-Item (Join-Path $TrafficMonitorPath '*.dll') $tmp -Force
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Copy-Item -Path (Join-Path $TrafficMonitorPath '*.dll') -Destination $tmp -Force
     $test = @'
 param($dir)
 Add-Type -Path (Join-Path $dir 'LibreHardwareMonitorLib.dll')
@@ -210,12 +235,12 @@ foreach ($h in $c.Hardware) {
 }
 $c.Close()
 '@
-    $tf = Join-Path $tmp 'test.ps1'; Set-Content $tf $test -Encoding UTF8
-    $res = & powershell -NoProfile -ExecutionPolicy Bypass -File $tf $tmp 2>&1
+    $tf = Join-Path $tmp 'test.ps1'; Set-Content -LiteralPath $tf -Value $test -Encoding UTF8
+    $res = & powershell -NoProfile -ExecutionPolicy Bypass -File "$tf" "$tmp" 2>&1
     $sensorReadings = @($res | ForEach-Object { "$_" })
     if ($res | Where-Object { $_ -match '^Cpu \|' }) { Ok 'CPU temperature read through PawnIO:'; if (-not $Json) { $res | ForEach-Object { Write-Host "       $_" } } }
     else { Bad 'Could not read CPU temperature'; if (-not $Json) { $res | ForEach-Object { Write-Host "       $_" } } }
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     if (Get-CimInstance Win32_SystemDriver -Filter "Name='R0TrafficMonitor'" -ErrorAction SilentlyContinue) {
         $r0ServicePresent = $true
         Bad 'WinRing0 service was recreated during the test'

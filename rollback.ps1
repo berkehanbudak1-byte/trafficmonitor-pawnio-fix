@@ -9,6 +9,13 @@
 param([string]$TrafficMonitorPath)
 $ErrorActionPreference = 'Stop'
 
+function Test-SafePath([string]$PathValue, [string]$ParamName = 'Path') {
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { Write-Host "[X] Invalid ${ParamName}: path cannot be empty." -ForegroundColor Red; exit 1 }
+    if ($PathValue -match '[\x00-\x1f]') { Write-Host "[X] Invalid ${ParamName}: control characters are not allowed." -ForegroundColor Red; exit 1 }
+    if ($PathValue -match '(^|[\\/])\.\.([\\/]|$)') { Write-Host "[X] Invalid ${ParamName}: path traversal ('..') is not allowed." -ForegroundColor Red; exit 1 }
+    return $PathValue.Trim()
+}
+
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Host '[X] Run from an elevated PowerShell.' -ForegroundColor Red; exit 1 }
 
@@ -18,8 +25,10 @@ if (-not $TrafficMonitorPath) {
     if ($proc) { try { $exePath = $proc.Path } catch {} }
     $TrafficMonitorPath = if ($exePath) { Split-Path $exePath } else { 'C:\Program Files\TrafficMonitor' }
 }
+$TrafficMonitorPath = Test-SafePath $TrafficMonitorPath 'TrafficMonitorPath'
+$tmDirFull = [IO.Path]::GetFullPath($TrafficMonitorPath).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 
-$backup = Get-ChildItem $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+$backup = Get-ChildItem -LiteralPath $TrafficMonitorPath -Directory -Filter '_backup_lhm_*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
 if (-not $backup) { Write-Host "[X] No _backup_lhm_* folder in $TrafficMonitorPath" -ForegroundColor Red; exit 1 }
 Write-Host "[*] Restoring from $($backup.FullName)"
 
@@ -32,12 +41,28 @@ if ($wasRunning) {
 
 # Remove DLLs that were added (not present before), then restore the saved originals
 $listFile = Join-Path $backup.FullName 'installed-files.txt'
-if (Test-Path $listFile) {
-    foreach ($name in Get-Content $listFile) {
-        if (-not (Test-Path (Join-Path $backup.FullName $name))) { Remove-Item (Join-Path $TrafficMonitorPath $name) -Force -ErrorAction SilentlyContinue }
+if (Test-Path -LiteralPath $listFile) {
+    foreach ($rawName in (Get-Content -LiteralPath $listFile)) {
+        $name = ([string]$rawName).Trim()
+        if (-not $name) { continue }
+        if ($name -notmatch '^[A-Za-z0-9._-]+\.dll$') {
+            Write-Host "[!] Skipping unsafe entry in installed-files.txt: '$name'" -ForegroundColor Yellow
+            continue
+        }
+        $targetPath = [IO.Path]::GetFullPath((Join-Path $TrafficMonitorPath $name))
+        if (-not $targetPath.StartsWith($tmDirFull, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "[!] Skipping out-of-directory entry in installed-files.txt: '$name'" -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $backup.FullName $name))) {
+            Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
-Get-ChildItem $backup.FullName -Filter *.dll | ForEach-Object { Copy-Item $_.FullName (Join-Path $TrafficMonitorPath $_.Name) -Force }
-Write-Host ("[OK] LibreHardwareMonitorLib {0} restored" -f (Get-Item (Join-Path $TrafficMonitorPath 'LibreHardwareMonitorLib.dll')).VersionInfo.FileVersion) -ForegroundColor Green
+Get-ChildItem -LiteralPath $backup.FullName -Filter '*.dll' | ForEach-Object {
+    if ($_.Name -notmatch '^[A-Za-z0-9._-]+\.dll$') { return }
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $TrafficMonitorPath $_.Name) -Force
+}
+Write-Host ("[OK] LibreHardwareMonitorLib {0} restored" -f (Get-Item -LiteralPath (Join-Path $TrafficMonitorPath 'LibreHardwareMonitorLib.dll')).VersionInfo.FileVersion) -ForegroundColor Green
 
-if ($wasRunning) { Start-Process (Join-Path $TrafficMonitorPath 'TrafficMonitor.exe') }
+if ($wasRunning) { Start-Process -FilePath (Join-Path $TrafficMonitorPath 'TrafficMonitor.exe') }

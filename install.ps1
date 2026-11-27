@@ -45,9 +45,40 @@ function Ok($m)   { Write-Host "[OK] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
 function Fail($m) { Write-Host "[X] $m" -ForegroundColor Red; exit 1 }
 
+function Test-SafePath([string]$PathValue, [string]$ParamName = 'Path') {
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { Fail "Invalid ${ParamName}: path cannot be empty." }
+    if ($PathValue -match '[\x00-\x1f]') { Fail "Invalid ${ParamName}: control characters are not allowed." }
+    if ($PathValue -match '(^|[\\/])\.\.([\\/]|$)') { Fail "Invalid ${ParamName}: path traversal ('..') is not allowed." }
+    return $PathValue.Trim()
+}
+
+function Test-SafeHttpsUrl([string]$Url, [string[]]$AllowedHosts = @('api.nuget.org')) {
+    if ([string]::IsNullOrWhiteSpace($Url) -or $Url -match '[\x00-\x1f]') { Fail "Invalid URL: '$Url'." }
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { Fail "Malformed URL: '$Url'." }
+    if ($uri.Scheme -ne 'https') { Fail "Insecure URL scheme '$($uri.Scheme)' rejected (HTTPS required): $Url" }
+    $hostLower = $uri.Host.ToLowerInvariant()
+    if ($AllowedHosts -notcontains $hostLower) { Fail "Untrusted download host '$hostLower' rejected: $Url" }
+    return $uri.AbsoluteUri
+}
+
+function Get-FileSha256Hex([string]$FilePath) {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash([IO.File]::ReadAllBytes($FilePath))
+        return ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
 # ---------------------------------------------------------------- 0. Pre-checks
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $DryRun -and -not $isAdmin) { Fail 'Run this script from an elevated (administrator) PowerShell, or use -DryRun.' }
+
+if ($LhmVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$') {
+    Fail "Invalid LhmVersion format: '$LhmVersion'."
+}
 
 if (-not $TrafficMonitorPath) {
     $proc = Get-Process TrafficMonitor -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -55,12 +86,13 @@ if (-not $TrafficMonitorPath) {
     if ($proc) { try { $exePath = $proc.Path } catch {} }
     $TrafficMonitorPath = if ($exePath) { Split-Path $exePath } else { 'C:\Program Files\TrafficMonitor' }
 }
+$TrafficMonitorPath = Test-SafePath $TrafficMonitorPath 'TrafficMonitorPath'
 $tmExe = Join-Path $TrafficMonitorPath 'TrafficMonitor.exe'
 $tmLhm = Join-Path $TrafficMonitorPath 'LibreHardwareMonitorLib.dll'
-if (-not (Test-Path $tmExe)) { Fail "TrafficMonitor.exe not found in '$TrafficMonitorPath'. Use -TrafficMonitorPath." }
-if (-not (Test-Path $tmLhm)) { Fail "LibreHardwareMonitorLib.dll not found in '$TrafficMonitorPath' (build without temperature support?)." }
-Info "TrafficMonitor: $tmExe ($((Get-Item $tmExe).VersionInfo.FileVersion))"
-Info "Current LibreHardwareMonitorLib: $((Get-Item $tmLhm).VersionInfo.FileVersion)"
+if (-not (Test-Path -LiteralPath $tmExe)) { Fail "TrafficMonitor.exe not found in '$TrafficMonitorPath'. Use -TrafficMonitorPath." }
+if (-not (Test-Path -LiteralPath $tmLhm)) { Fail "LibreHardwareMonitorLib.dll not found in '$TrafficMonitorPath' (build without temperature support?)." }
+Info "TrafficMonitor: $tmExe ($((Get-Item -LiteralPath $tmExe).VersionInfo.FileVersion))"
+Info "Current LibreHardwareMonitorLib: $((Get-Item -LiteralPath $tmLhm).VersionInfo.FileVersion)"
 
 # Architecture of TrafficMonitor.exe -> runtime folder of the NuGet package
 $bytes = [IO.File]::ReadAllBytes($tmExe)
@@ -79,7 +111,7 @@ Ok "PawnIO driver present ($($pawn.State))"
 # ---------------------------------------------------------------- 1. Download + verify
 $work = Join-Path $env:TEMP ("tm-pawnio-fix-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $pkgDir = Join-Path $work 'pkg'; $outDir = Join-Path $work 'out'
-New-Item -ItemType Directory -Force $pkgDir, $outDir | Out-Null
+New-Item -ItemType Directory -Force -Path $pkgDir, $outDir | Out-Null
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $tfmPref = 'net472', 'net471', 'net47', 'net462', 'net461', 'net46', 'net45', 'netstandard2.0'
@@ -89,28 +121,58 @@ function Normalize-Tfm([string]$t) {
     return $t
 }
 function Get-CatalogHash([string]$id, [string]$ver) {
-    $leaf = Invoke-RestMethod "https://api.nuget.org/v3/registration5-semver1/$($id.ToLower())/$($ver.ToLower()).json"
-    return (Invoke-RestMethod $leaf.catalogEntry).packageHash
+    $regUrl = Test-SafeHttpsUrl "https://api.nuget.org/v3/registration5-semver1/$($id.ToLowerInvariant())/$($ver.ToLowerInvariant()).json"
+    $leaf = Invoke-RestMethod -Uri $regUrl -UseBasicParsing
+    $catUrl = Test-SafeHttpsUrl ([string]$leaf.catalogEntry)
+    $catalog = Invoke-RestMethod -Uri $catUrl -UseBasicParsing
+    if ($catalog.packageHashAlgorithm -and $catalog.packageHashAlgorithm -ne 'SHA512') {
+        Fail "Unexpected NuGet hash algorithm '$($catalog.packageHashAlgorithm)' for $id $ver."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$catalog.packageHash)) {
+        Fail "NuGet catalog did not return a packageHash for $id $ver."
+    }
+    return [string]$catalog.packageHash
 }
 
 $done = @{}
+$extractedSha256 = @{}
 $queue = New-Object System.Collections.Queue
 $queue.Enqueue(@('LibreHardwareMonitorLib', $LhmVersion))
 while ($queue.Count) {
     $id, $ver = $queue.Dequeue()
-    if ($done.ContainsKey($id.ToLower())) { continue }
-    $done[$id.ToLower()] = $ver
-    $lid = $id.ToLower(); $lver = $ver.ToLower()
+    if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or $ver -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$') {
+        Fail "Invalid NuGet package identifier or version: '$id' '$ver'."
+    }
+    $lid = $id.ToLowerInvariant(); $lver = $ver.ToLowerInvariant()
+    if ($done.ContainsKey($lid)) { continue }
+    $done[$lid] = $ver
     $nupkg = Join-Path $pkgDir "$lid.$lver.nupkg"
-    Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$lid/$lver/$lid.$lver.nupkg" -OutFile $nupkg -UseBasicParsing
+    $pkgUrl = Test-SafeHttpsUrl "https://api.nuget.org/v3-flatcontainer/$lid/$lver/$lid.$lver.nupkg"
+    Invoke-WebRequest -Uri $pkgUrl -OutFile $nupkg -UseBasicParsing
 
     $sha = [Security.Cryptography.SHA512]::Create()
     try { $local = [Convert]::ToBase64String($sha.ComputeHash([IO.File]::ReadAllBytes($nupkg))) } finally { $sha.Dispose() }
-    if ($local -ne (Get-CatalogHash $id $ver)) { Fail "Hash mismatch for $id $ver - aborting." }
+    $expectedHash = Get-CatalogHash $id $ver
+    if ($local -ne $expectedHash) { Fail "Hash mismatch for $id $ver - aborting." }
+    $pkgSha256 = Get-FileSha256Hex $nupkg
 
     $zip = [IO.Compression.ZipFile]::OpenRead($nupkg)
     try {
-        $nuspec = [xml](New-Object IO.StreamReader(($zip.Entries | Where-Object { $_.FullName -like '*.nuspec' })[0].Open())).ReadToEnd()
+        $nuspecEntry = ($zip.Entries | Where-Object { $_.FullName -like '*.nuspec' }) | Select-Object -First 1
+        if (-not $nuspecEntry) { Fail "Missing .nuspec in $id $ver." }
+        $xmlSettings = New-Object System.Xml.XmlReaderSettings
+        $xmlSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+        $xmlSettings.XmlResolver = $null
+        $entryStream = $nuspecEntry.Open()
+        $xmlReader = [System.Xml.XmlReader]::Create($entryStream, $xmlSettings)
+        try {
+            $nuspec = New-Object System.Xml.XmlDocument
+            $nuspec.XmlResolver = $null
+            $nuspec.Load($xmlReader)
+        } finally {
+            $xmlReader.Dispose()
+            $entryStream.Dispose()
+        }
         $groups = @($nuspec.package.metadata.dependencies.group)
         $group = $null
         foreach ($t in $tfmPref) { $group = $groups | Where-Object { $_ -and (Normalize-Tfm $_.targetFramework) -eq $t } | Select-Object -First 1; if ($group) { break } }
@@ -119,23 +181,30 @@ while ($queue.Count) {
         # LibreHardwareMonitorLib ships per-RID builds under runtimes/<rid>/lib/<tfm>/, others under lib/<tfm>/
         $libRoots = @("runtimes/$rid/lib", 'lib')
         $copied = $false
+        $outDirFull = [IO.Path]::GetFullPath($outDir).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
         foreach ($root in $libRoots) {
             foreach ($t in $tfmPref) {
                 # "_._" = placeholder: the assembly is provided by .NET Framework itself, nothing to copy
                 if ($zip.Entries | Where-Object { $_.FullName -eq "$root/$t/_._" }) { $copied = $null; break }
                 $entries = $zip.Entries | Where-Object { $_.FullName -like "$root/$t/*.dll" }
                 if ($entries) {
-                    foreach ($e in $entries) { [IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $outDir $e.Name), $true) }
+                    foreach ($e in $entries) {
+                        if ($e.Name -notmatch '^[A-Za-z0-9._-]+\.dll$') { Fail "Unsafe DLL entry name rejected: '$($e.Name)'" }
+                        $destDll = [IO.Path]::GetFullPath((Join-Path $outDir $e.Name))
+                        if (-not $destDll.StartsWith($outDirFull, [StringComparison]::OrdinalIgnoreCase)) { Fail "Zip-slip extraction path rejected: '$($e.FullName)'" }
+                        [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $destDll, $true)
+                        $extractedSha256[$e.Name] = Get-FileSha256Hex $destDll
+                    }
                     $copied = $true; break
                 }
             }
             if ($copied -ne $false) { break }
         }
-        Info ("{0} {1}: hash OK{2}" -f $id, $ver, $(if ($copied) { '' } else { ' (no DLL needed on .NET Framework)' }))
+        Info ("{0} {1}: SHA-512 OK | SHA-256={2}{3}" -f $id, $ver, $pkgSha256.Substring(0, 16), $(if ($copied) { '' } else { ' (no DLL needed on .NET Framework)' }))
     } finally { $zip.Dispose() }
 }
 $newLhm = Join-Path $outDir 'LibreHardwareMonitorLib.dll'
-if (-not (Test-Path $newLhm)) { Fail 'LibreHardwareMonitorLib.dll was not extracted.' }
+if (-not (Test-Path -LiteralPath $newLhm)) { Fail 'LibreHardwareMonitorLib.dll was not extracted.' }
 Ok "Downloaded and verified $($done.Count) packages from nuget.org"
 
 # ---------------------------------------------------------------- 2. Compatibility checks
@@ -158,29 +227,29 @@ function E($n) { $t = $a.GetType($n); ($t.GetFields('Public,Static') | Where-Obj
 'IS:' + (($a.GetType('LibreHardwareMonitor.Hardware.ISensor').GetProperties() | Where-Object { $_.Name -in 'SensorType','Name','Value' } | ForEach-Object { $_.Name + ':' + $_.PropertyType.Name } | Sort-Object) -join ';')
 '@
 $probeFile = Join-Path $work 'probe.ps1'
-Set-Content $probeFile $probe -Encoding UTF8
-$oldApi = & powershell -NoProfile -ExecutionPolicy Bypass -File $probeFile $tmLhm
-$newApi = & powershell -NoProfile -ExecutionPolicy Bypass -File $probeFile $newLhm
+Set-Content -LiteralPath $probeFile -Value $probe -Encoding UTF8
+$oldApi = & powershell -NoProfile -ExecutionPolicy Bypass -File "$probeFile" "$tmLhm"
+$newApi = & powershell -NoProfile -ExecutionPolicy Bypass -File "$probeFile" "$newLhm"
 $diff = Compare-Object $oldApi $newApi
 if ($diff) { $diff | Format-Table | Out-String | Write-Host; Fail 'API used by TrafficMonitor differs between versions - aborting.' }
 Ok 'API used by TrafficMonitor is identical (enums Clock/Load/Temperature, Computer, IVisitor, IHardware, ISensor)'
 
 if ($DryRun) {
     Ok "Dry run finished. Files ready in: $outDir"
-    Get-ChildItem $outDir | Select-Object Name, @{ n = 'Version'; e = { $_.VersionInfo.FileVersion } } | Format-Table -AutoSize | Out-String | Write-Host
+    Get-ChildItem -LiteralPath $outDir | Select-Object Name, @{ n = 'Version'; e = { $_.VersionInfo.FileVersion } }, @{ n = 'SHA256'; e = { $extractedSha256[$_.Name] } } | Format-Table -AutoSize | Out-String | Write-Host
     exit 0
 }
 
 # ---------------------------------------------------------------- 3. Backup
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backup = Join-Path $TrafficMonitorPath "_backup_lhm_$stamp"
-New-Item -ItemType Directory -Force $backup | Out-Null
-Copy-Item $tmLhm $backup -Force
-Get-ChildItem $outDir -Filter *.dll | ForEach-Object {
+New-Item -ItemType Directory -Force -Path $backup | Out-Null
+Copy-Item -LiteralPath $tmLhm -Destination $backup -Force
+Get-ChildItem -LiteralPath $outDir -Filter '*.dll' | ForEach-Object {
     $existing = Join-Path $TrafficMonitorPath $_.Name
-    if (Test-Path $existing) { Copy-Item $existing $backup -Force }
+    if (Test-Path -LiteralPath $existing) { Copy-Item -LiteralPath $existing -Destination $backup -Force }
 }
-Get-ChildItem $outDir -Filter *.dll | Select-Object -ExpandProperty Name | Set-Content (Join-Path $backup 'installed-files.txt')
+Get-ChildItem -LiteralPath $outDir -Filter '*.dll' | Select-Object -ExpandProperty Name | Set-Content -LiteralPath (Join-Path $backup 'installed-files.txt') -Encoding UTF8
 Ok "Backup: $backup"
 
 # ---------------------------------------------------------------- 4. Close TrafficMonitor, remove WinRing0
@@ -194,19 +263,25 @@ if ($wasRunning) {
 # The old library installs WinRing0 as service "R0<exe name>" with driver file "<exe name>.sys"
 $svc = 'R0TrafficMonitor'
 if (Get-CimInstance Win32_SystemDriver -Filter "Name='$svc'" -ErrorAction SilentlyContinue) {
-    sc.exe stop $svc | Out-Null
+    sc.exe stop "$svc" | Out-Null
     Start-Sleep -Seconds 1
-    sc.exe delete $svc | Out-Null
+    sc.exe delete "$svc" | Out-Null
     Ok "WinRing0 service '$svc' removed"
 }
 $sys = Join-Path $TrafficMonitorPath 'TrafficMonitor.sys'
-if (Test-Path $sys) { Remove-Item $sys -Force; Ok 'WinRing0 driver file TrafficMonitor.sys deleted' }
+if (Test-Path -LiteralPath $sys) { Remove-Item -LiteralPath $sys -Force; Ok 'WinRing0 driver file TrafficMonitor.sys deleted' }
 
 # ---------------------------------------------------------------- 5. Install
-Get-ChildItem $outDir -Filter *.dll | ForEach-Object { Copy-Item $_.FullName (Join-Path $TrafficMonitorPath $_.Name) -Force }
-Ok ("LibreHardwareMonitorLib {0} installed" -f (Get-Item $tmLhm).VersionInfo.FileVersion)
+Get-ChildItem -LiteralPath $outDir -Filter '*.dll' | ForEach-Object {
+    $currentSha256 = Get-FileSha256Hex $_.FullName
+    if ($extractedSha256.ContainsKey($_.Name) -and $currentSha256 -ne $extractedSha256[$_.Name]) {
+        Fail "SHA-256 integrity check failed for staged file '$($_.Name)' - aborting."
+    }
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $TrafficMonitorPath $_.Name) -Force
+}
+Ok ("LibreHardwareMonitorLib {0} installed" -f (Get-Item -LiteralPath $tmLhm).VersionInfo.FileVersion)
 
-if ($wasRunning) { Start-Process $tmExe; Ok 'TrafficMonitor restarted' }
-Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+if ($wasRunning) { Start-Process -FilePath $tmExe; Ok 'TrafficMonitor restarted' }
+Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ''
 Ok 'Done. Run .\verify.ps1 (as administrator) to check the result.'
