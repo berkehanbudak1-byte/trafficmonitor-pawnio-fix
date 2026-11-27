@@ -183,6 +183,90 @@ class TestPawnIOScripts(unittest.TestCase):
         for flag in ("-Json", "-SelfTest", "-ExportReport"):
             self.assertIn(flag, readme, f"README.md must document {flag}")
 
+    def test_verify_ps1_strict_csp_meta_and_head_injection(self):
+        verify_src = (ROOT / "verify.ps1").read_text(encoding="utf-8")
+        expected_csp = (
+            "<meta http-equiv=`\"Content-Security-Policy`\" "
+            "content=`\"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; "
+            "base-uri 'none'; form-action 'none';`\">"
+        )
+        self.assertIn(expected_csp, verify_src)
+        self.assertIn(f'$cspMeta = "{expected_csp}"', verify_src)
+        self.assertIn('<head><meta charset=`"utf-8`">$cspMeta<title>', verify_src)
+        self.assertNotIn("unsafe-eval", verify_src)
+
+    def test_verify_ps1_html_escapes_all_dynamic_report_fields(self):
+        verify_src = (ROOT / "verify.ps1").read_text(encoding="utf-8")
+
+        # Verify ConvertTo-SafeHtml handles null, strips control chars, HTML-encodes, and encodes single quotes
+        fn_match = re.search(r"function ConvertTo-SafeHtml\([^\n]*\)\s*\{.*?\n\}", verify_src, flags=re.S)
+        self.assertIsNotNone(fn_match)
+        fn_body = fn_match.group(0)
+        self.assertIn("if ($null -eq $Value) { return '' }", fn_body)
+        self.assertIn("[System.Net.WebUtility]::HtmlEncode", fn_body)
+        self.assertIn("-replace \"'\", '&#39;'", fn_body)
+
+        # Verify every dynamic field rendered into HTML goes through ConvertTo-SafeHtml
+        required_escaped_exprs = (
+            "ConvertTo-SafeHtml $computerName",
+            "ConvertTo-SafeHtml $statusLabel",
+            "ConvertTo-SafeHtml $ts",
+            "ConvertTo-SafeHtml $report.checks.clean_dll_passes",
+            "ConvertTo-SafeHtml $report.checks.winring0_dll_detected",
+            "ConvertTo-SafeHtml $report.is_admin",
+            "ConvertTo-SafeHtml $report.traffic_monitor.path",
+            "ConvertTo-SafeHtml $report.traffic_monitor.exe_version",
+            "ConvertTo-SafeHtml $report.traffic_monitor.lhm_version",
+            "ConvertTo-SafeHtml $report.traffic_monitor.embeds_winring0",
+            "ConvertTo-SafeHtml $report.winring0.service_present",
+            "ConvertTo-SafeHtml $report.winring0.service_name",
+            "ConvertTo-SafeHtml $report.winring0.driver_file_present",
+            "ConvertTo-SafeHtml $report.pawnio.installed",
+            "ConvertTo-SafeHtml $report.pawnio.state",
+            "ConvertTo-SafeHtml $report.backup.count",
+            "ConvertTo-SafeHtml $report.backup.latest_path",
+            "ForEach-Object { ConvertTo-SafeHtml $_ }",
+        )
+        for expr in required_escaped_exprs:
+            self.assertIn(expr, verify_src, f"Missing HTML escaping expression: {expr}")
+
+        # Audit the HTML construction section so no raw $report/$computerName/$statusLabel/$ts slips in unescaped
+        export_match = re.search(
+            r"\$badgeBg\s*=.*?\n\}",
+            verify_src,
+            flags=re.S,
+        )
+        self.assertIsNotNone(export_match)
+        html_section = export_match.group(0)
+        row_strings = re.findall(r'\[void\]\$rows\.Add\("([^"]*)"\)', html_section)
+        self.assertGreaterEqual(len(row_strings), 10)
+        for row_html in row_strings:
+            # Strip valid $(ConvertTo-SafeHtml ...) calls and known pre-escaped local vars
+            stripped = re.sub(r"\$\(ConvertTo-SafeHtml\s+[^)]+\)", "", row_html)
+            for safe_var in ("$r0SvcDetail", "$sensorTxt", "$errTxt"):
+                stripped = stripped.replace(safe_var, "")
+            self.assertNotIn("$", stripped, f"Unescaped variable interpolation in HTML row: {row_html}")
+
+        html_line_match = re.search(r'^\s*\$html\s*=\s*".*"$', html_section, flags=re.M)
+        self.assertIsNotNone(html_line_match)
+        html_line = html_line_match.group(0)
+        # Only pre-sanitized / constant variables allowed inside $html template
+        interpolated_vars = set(re.findall(r"\$[A-Za-z_][A-Za-z0-9_]*", html_line.split("=", 1)[1]))
+        self.assertEqual(
+            interpolated_vars,
+            {"$cspMeta", "$badgeBg", "$safeBadge", "$rowHtml"},
+            f"Unexpected variables interpolated in $html: {interpolated_vars}",
+        )
+
+    def test_verify_ps1_export_report_path_and_symlink_guards(self):
+        verify_src = (ROOT / "verify.ps1").read_text(encoding="utf-8")
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", verify_src)
+        self.assertIn("symbolic links and reparse points are not allowed", verify_src)
+        self.assertIn("parent directory cannot be a symbolic link or reparse point", verify_src)
+        self.assertIn("[IO.Directory]::Exists($fullOutPath)", verify_src)
+        self.assertIn("^\\\\\\\\[.?]\\\\", verify_src)
+        self.assertIn("Out-File -LiteralPath $fullOutPath -Encoding utf8", verify_src)
+
     def test_ci_workflow_runs_unittest_discover(self):
         ci = ROOT / ".github" / "workflows" / "ci.yml"
         self.assertTrue(ci.exists(), ".github/workflows/ci.yml missing")
